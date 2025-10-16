@@ -65,40 +65,34 @@ CREATE POLICY "Authenticated users can create rewards"
     ON public.rewards
     FOR INSERT
     TO authenticated
-    WITH CHECK (created_by = auth.uid());
+    WITH CHECK (created_by = (select auth.uid()));
 
 -- Users can update rewards they created
 CREATE POLICY "Users can update their rewards"
     ON public.rewards
     FOR UPDATE
     TO authenticated
-    USING (created_by = auth.uid());
+    USING (created_by = (select auth.uid()));
 
 -- Users can delete rewards they created
 CREATE POLICY "Users can delete their rewards"
     ON public.rewards
     FOR DELETE
     TO authenticated
-    USING (created_by = auth.uid());
+    USING (created_by = (select auth.uid()));
 
 -- RLS Policies for reward_redemptions table
--- Users can view their own redemptions
-CREATE POLICY "Users can view their own redemptions"
-    ON public.reward_redemptions
-    FOR SELECT
-    TO authenticated
-    USING (user_id = auth.uid());
-
--- Allow viewing redemptions for rewards you created
-CREATE POLICY "Reward creators can view redemptions"
+-- Consolidated SELECT policy: users can view their own redemptions OR redemptions for rewards they created
+CREATE POLICY "Users can view redemptions"
     ON public.reward_redemptions
     FOR SELECT
     TO authenticated
     USING (
+        user_id = (select auth.uid()) OR
         EXISTS (
             SELECT 1 FROM public.rewards r
             WHERE r.id = reward_redemptions.reward_id
-            AND r.created_by = auth.uid()
+            AND r.created_by = (select auth.uid())
         )
     );
 
@@ -107,7 +101,7 @@ CREATE POLICY "Users can create redemption requests"
     ON public.reward_redemptions
     FOR INSERT
     TO authenticated
-    WITH CHECK (user_id = auth.uid());
+    WITH CHECK (user_id = (select auth.uid()));
 
 -- Reward creators can update redemption status
 CREATE POLICY "Reward creators can update redemptions"
@@ -118,7 +112,7 @@ CREATE POLICY "Reward creators can update redemptions"
         EXISTS (
             SELECT 1 FROM public.rewards r
             WHERE r.id = reward_redemptions.reward_id
-            AND r.created_by = auth.uid()
+            AND r.created_by = (select auth.uid())
         )
     );
 
@@ -130,16 +124,18 @@ CREATE OR REPLACE FUNCTION check_user_points_for_redemption(
 RETURNS BOOLEAN
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = ''
 AS $$
 DECLARE
     v_user_points INTEGER;
 BEGIN
-    -- Calculate user's current points from approved mission submissions
-    SELECT COALESCE(SUM(points_awarded), 0)
+    -- Calculate user's current points from point_transactions
+    -- Note: agents.id IS the user_id (references auth.users)
+    SELECT COALESCE(SUM(points_amount), 0)
     INTO v_user_points
-    FROM public.mission_submissions
-    WHERE user_id = p_user_id
-    AND status = 'approved';
+    FROM public.point_transactions
+    WHERE agent_id = p_user_id
+    AND transaction_type IN ('earned', 'bonus');
     
     -- Subtract points already spent on redemptions
     SELECT v_user_points - COALESCE(SUM(points_spent), 0)
@@ -160,6 +156,7 @@ CREATE OR REPLACE FUNCTION redeem_reward(
 RETURNS UUID
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = ''
 AS $$
 DECLARE
     v_user_id UUID;
@@ -247,6 +244,7 @@ CREATE OR REPLACE FUNCTION review_redemption(
 RETURNS BOOLEAN
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = ''
 AS $$
 DECLARE
     v_reviewer_id UUID;
@@ -314,17 +312,19 @@ CREATE OR REPLACE FUNCTION get_user_available_points(p_user_id UUID)
 RETURNS INTEGER
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = ''
 AS $$
 DECLARE
     v_earned_points INTEGER;
     v_spent_points INTEGER;
 BEGIN
-    -- Calculate earned points from approved missions
-    SELECT COALESCE(SUM(points_awarded), 0)
+    -- Calculate earned points from point_transactions
+    -- Note: agents.id IS the user_id (references auth.users)
+    SELECT COALESCE(SUM(points_amount), 0)
     INTO v_earned_points
-    FROM public.mission_submissions
-    WHERE user_id = p_user_id
-    AND status = 'approved';
+    FROM public.point_transactions
+    WHERE agent_id = p_user_id
+    AND transaction_type IN ('earned', 'bonus');
     
     -- Calculate spent points from approved/fulfilled redemptions
     SELECT COALESCE(SUM(points_spent), 0)
@@ -341,13 +341,13 @@ $$;
 CREATE TRIGGER update_rewards_updated_at
     BEFORE UPDATE ON public.rewards
     FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+    EXECUTE FUNCTION public.update_updated_at_column();
 
 -- Create updated_at trigger for reward_redemptions
 CREATE TRIGGER update_reward_redemptions_updated_at
     BEFORE UPDATE ON public.reward_redemptions
     FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+    EXECUTE FUNCTION public.update_updated_at_column();
 
 -- Grant necessary permissions
 GRANT USAGE ON SCHEMA public TO authenticated;
