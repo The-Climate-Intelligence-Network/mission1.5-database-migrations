@@ -53,12 +53,15 @@ ALTER TABLE public.rewards ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.reward_redemptions ENABLE ROW LEVEL SECURITY;
 
 -- RLS Policies for rewards table
--- Anyone authenticated can view active rewards
-CREATE POLICY "Anyone can view active rewards"
+-- Users can view active rewards OR their own rewards (any status)
+CREATE POLICY "Users can view rewards"
     ON public.rewards
     FOR SELECT
     TO authenticated
-    USING (status = 'active');
+    USING (
+        status = 'active' OR 
+        created_by = (select auth.uid())
+    );
 
 -- Authenticated users can create rewards (adjust based on your auth logic)
 CREATE POLICY "Authenticated users can create rewards"
@@ -67,12 +70,13 @@ CREATE POLICY "Authenticated users can create rewards"
     TO authenticated
     WITH CHECK (created_by = (select auth.uid()));
 
--- Users can update rewards they created
+-- Users can update rewards they created (both USING and WITH CHECK required)
 CREATE POLICY "Users can update their rewards"
     ON public.rewards
     FOR UPDATE
     TO authenticated
-    USING (created_by = (select auth.uid()));
+    USING (created_by = (select auth.uid()))
+    WITH CHECK (created_by = (select auth.uid()));
 
 -- Users can delete rewards they created
 CREATE POLICY "Users can delete their rewards"
@@ -117,7 +121,7 @@ CREATE POLICY "Reward creators can update redemptions"
     );
 
 -- Function to check if user has enough points
-CREATE OR REPLACE FUNCTION check_user_points_for_redemption(
+CREATE OR REPLACE FUNCTION public.check_user_points_for_redemption(
     p_user_id UUID,
     p_points_cost INTEGER
 )
@@ -149,7 +153,7 @@ END;
 $$;
 
 -- Function to handle reward redemption
-CREATE OR REPLACE FUNCTION redeem_reward(
+CREATE OR REPLACE FUNCTION public.redeem_reward(
     p_reward_id UUID,
     p_redemption_notes TEXT DEFAULT NULL
 )
@@ -163,7 +167,6 @@ DECLARE
     v_points_cost INTEGER;
     v_quantity_available INTEGER;
     v_redemption_id UUID;
-    v_agent_profile_id UUID;
 BEGIN
     v_user_id := auth.uid();
     
@@ -171,10 +174,10 @@ BEGIN
         RAISE EXCEPTION 'User must be authenticated';
     END IF;
     
-    -- Get agent profile id
-    SELECT id INTO v_agent_profile_id
-    FROM public.agent_profiles
-    WHERE user_id = v_user_id;
+    -- Verify user exists as an agent
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = v_user_id) THEN
+        RAISE EXCEPTION 'User is not registered as an agent';
+    END IF;
     
     -- Get reward details
     SELECT points_cost, quantity_available
@@ -195,7 +198,7 @@ BEGIN
     END IF;
     
     -- Check if user has enough points
-    IF NOT check_user_points_for_redemption(v_user_id, v_points_cost) THEN
+    IF NOT public.check_user_points_for_redemption(v_user_id, v_points_cost) THEN
         RAISE EXCEPTION 'Insufficient points';
     END IF;
     
@@ -203,14 +206,12 @@ BEGIN
     INSERT INTO public.reward_redemptions (
         reward_id,
         user_id,
-        agent_profile_id,
         points_spent,
         redemption_notes,
         status
     ) VALUES (
         p_reward_id,
         v_user_id,
-        v_agent_profile_id,
         v_points_cost,
         p_redemption_notes,
         'pending'
@@ -236,7 +237,7 @@ END;
 $$;
 
 -- Function to approve/reject redemption
-CREATE OR REPLACE FUNCTION review_redemption(
+CREATE OR REPLACE FUNCTION public.review_redemption(
     p_redemption_id UUID,
     p_status TEXT,
     p_review_notes TEXT DEFAULT NULL
@@ -254,11 +255,11 @@ DECLARE
 BEGIN
     v_reviewer_id := auth.uid();
     
-    -- Check if user is admin
+    -- Check if user is admin (check user_roles table for 'admin' role)
     SELECT EXISTS (
-        SELECT 1 FROM public.agent_profiles
+        SELECT 1 FROM public.user_roles
         WHERE user_id = v_reviewer_id
-        AND role IN ('cin_admin', 'organization_admin')
+        AND role = 'admin'
     ) INTO v_is_admin;
     
     IF NOT v_is_admin THEN
@@ -308,7 +309,7 @@ END;
 $$;
 
 -- Function to get user's available points
-CREATE OR REPLACE FUNCTION get_user_available_points(p_user_id UUID)
+CREATE OR REPLACE FUNCTION public.get_user_available_points(p_user_id UUID)
 RETURNS INTEGER
 LANGUAGE plpgsql
 SECURITY DEFINER
